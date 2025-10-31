@@ -193,7 +193,7 @@ Columns:
 
 ## Performance Tips
 
-1. **Use appropriate Hamming distance**: Higher values slow down search. Start with `-m 1` for exact/near-exact matching.
+1. **Use appropriate Hamming distance**: Higher values slow down search. Start with `-m 0` for exact matching or `-m 1` for near-exact matching.
 
 2. **Thread count**: Use `-t` to match your CPU count for best performance.
 
