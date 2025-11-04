@@ -4,13 +4,12 @@ A fast, multi-threaded tool for filtering FASTA/FASTQ reads based on k-mer match
 
 ## Features
 
+- **Hybrid index architecture**: Bloom filter + hash table + BK-tree
 - **Multiple input formats**: Paired-end, single-end, or interleaved (mixed paired/single)
 - **Auto-detection**: Automatically detects FASTA or FASTQ input
 - **Flexible output**: Output as FASTA or FASTQ (optionally gzip-compressed)
-- **Approximate matching**: Configurable Hamming distance tolerance
+- **Approximate matching**: Configurable Hamming distance tolerance (0-2+)
 - **Multi-threaded**: Scales across multiple CPU cores
-- **Verbose reporting**: Per-read match statistics including k-mer counts and distances
-- **BK-tree indexing**: Efficient data structure for fast k-mer lookups
 
 ## Installation
 
