@@ -18,7 +18,7 @@ import (
 	"github.com/cheggaaa/pb/v3"
 )
 
-const version = "1.0.0"
+const version = "1.1.0"
 
 type BKNode struct {
 	Kmer     string
@@ -129,35 +129,216 @@ func (node *BKNode) searchDetailed(kmer string, maxDist int, bestMatch string, b
 	return found, bestMatch, bestDist
 }
 
-func (tree *BKTree) Save(filename string) error {
+type BloomFilter struct {
+	bits  [256]uint64
+	seeds [3]uint32
+}
+
+func NewBloomFilter() *BloomFilter {
+	return &BloomFilter{
+		seeds: [3]uint32{2166136261, 2654435761, 981770721},
+	}
+}
+
+func fnv1a(s string, seed uint32) uint32 {
+	h := seed
+	for _, c := range s {
+		h ^= uint32(c)
+		h *= 16777619
+	}
+	return h
+}
+
+func (bf *BloomFilter) hashesToPositions(kmer string) [3]uint16 {
+	return [3]uint16{
+		uint16(fnv1a(kmer, bf.seeds[0]) % 2048),
+		uint16(fnv1a(kmer, bf.seeds[1]) % 2048),
+		uint16(fnv1a(kmer, bf.seeds[2]) % 2048),
+	}
+}
+
+func (bf *BloomFilter) Add(kmer string) {
+	pos := bf.hashesToPositions(kmer)
+	for _, p := range pos {
+		bf.bits[p/64] |= 1 << (p % 64)
+	}
+}
+
+func (bf *BloomFilter) Contains(kmer string) bool {
+	pos := bf.hashesToPositions(kmer)
+	for _, p := range pos {
+		if (bf.bits[p/64] & (1 << (p % 64))) == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+type FastKmerIndex struct {
+	exact    map[string]bool
+	variants map[string]int
+	k        int
+}
+
+func NewFastKmerIndex(k int) *FastKmerIndex {
+	return &FastKmerIndex{
+		exact:    make(map[string]bool),
+		variants: make(map[string]int),
+		k:        k,
+	}
+}
+
+func (idx *FastKmerIndex) BuildFromKmers(kmers []string) {
+	for _, kmer := range kmers {
+		idx.exact[kmer] = true
+
+		for i := 0; i < len(kmer); i++ {
+			for _, base := range "ACGT" {
+				if byte(base) != kmer[i] {
+					variant := kmer[:i] + string(base) + kmer[i+1:]
+					idx.variants[variant] = 1
+				}
+			}
+		}
+	}
+	log.Printf("Fast index built: %d exact k-mers, %d distance-1 variants", len(idx.exact), len(idx.variants))
+}
+
+func (idx *FastKmerIndex) SearchFast(kmer string, maxDist int) (bool, int) {
+	if idx.exact[kmer] {
+		return true, 0
+	}
+	if maxDist >= 1 {
+		if dist, exists := idx.variants[kmer]; exists {
+			return true, dist
+		}
+	}
+	return false, -1
+}
+
+type HybridIndexSerialized struct {
+	ExactKmers   map[string]bool
+	VariantKmers map[string]int
+	BloomBits    [256]uint64
+	BKTree       *BKTree
+	K            int
+}
+
+type HybridIndex struct {
+	fastIdx     *FastKmerIndex
+	bkTree      *BKTree
+	bloomFilter *BloomFilter
+}
+
+func NewHybridIndex(bkTree *BKTree) *HybridIndex {
+	return &HybridIndex{
+		fastIdx:     NewFastKmerIndex(bkTree.K),
+		bkTree:      bkTree,
+		bloomFilter: NewBloomFilter(),
+	}
+}
+
+func (h *HybridIndex) BuildFromBKTree() {
+	kmers := h.extractAllKmers(h.bkTree.Root)
+	log.Printf("Extracting %d k-mers for indexing...", len(kmers))
+	h.fastIdx.BuildFromKmers(kmers)
+
+	log.Printf("Building Bloom filter...")
+	for _, kmer := range kmers {
+		h.bloomFilter.Add(kmer)
+	}
+	log.Printf("Bloom filter ready (2KB, 3 hash functions)")
+}
+
+func (h *HybridIndex) extractAllKmers(node *BKNode) []string {
+	if node == nil {
+		return []string{}
+	}
+	kmers := []string{node.Kmer}
+	for _, child := range node.Children {
+		kmers = append(kmers, h.extractAllKmers(child)...)
+	}
+	return kmers
+}
+
+func (h *HybridIndex) Search(kmer string, maxDist int) (bool, int) {
+	if !h.bloomFilter.Contains(kmer) {
+		return false, -1
+	}
+
+	if found, dist := h.fastIdx.SearchFast(kmer, maxDist); found {
+		return true, dist
+	}
+
+	if maxDist >= 2 {
+		if h.bkTree.Search(kmer, maxDist) {
+			return true, -1
+		}
+	}
+
+	return false, -1
+}
+
+func (h *HybridIndex) Save(filename string) error {
+	log.Printf("Serializing hybrid index components...")
+
 	file, err := os.Create(filename)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
+
 	gzWriter := gzip.NewWriter(file)
 	defer gzWriter.Close()
+
+	serialized := HybridIndexSerialized{
+		ExactKmers:   h.fastIdx.exact,
+		VariantKmers: h.fastIdx.variants,
+		BloomBits:    h.bloomFilter.bits,
+		BKTree:       h.bkTree,
+		K:            h.bkTree.K,
+	}
+
 	encoder := gob.NewEncoder(gzWriter)
-	return encoder.Encode(tree)
+	return encoder.Encode(serialized)
 }
 
-func LoadBKTree(filename string) (*BKTree, error) {
+func LoadHybridIndex(filename string) (*HybridIndex, error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
+
 	gzReader, err := gzip.NewReader(file)
 	if err != nil {
 		return nil, err
 	}
 	defer gzReader.Close()
-	var tree BKTree
+
+	var serialized HybridIndexSerialized
 	decoder := gob.NewDecoder(gzReader)
-	if err := decoder.Decode(&tree); err != nil {
+	if err := decoder.Decode(&serialized); err != nil {
 		return nil, err
 	}
-	return &tree, nil
+
+	fastIdx := NewFastKmerIndex(serialized.K)
+	fastIdx.exact = serialized.ExactKmers
+	fastIdx.variants = serialized.VariantKmers
+
+	bloomFilter := NewBloomFilter()
+	bloomFilter.bits = serialized.BloomBits
+
+	hybrid := &HybridIndex{
+		fastIdx:     fastIdx,
+		bkTree:      serialized.BKTree,
+		bloomFilter: bloomFilter,
+	}
+
+	log.Printf("Loaded hybrid index: %d exact k-mers, %d variants, BK-tree with %d nodes",
+		len(fastIdx.exact), len(fastIdx.variants), serialized.BKTree.Count)
+
+	return hybrid, nil
 }
 
 var complementTable = [256]byte{
@@ -279,38 +460,45 @@ func buildCommand() *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "build",
-		Short: "Build BK-tree index from k-mer list",
-		Long:  "Build a BK-tree index from a k-mer list (e.g., meryl print output) for efficient approximate matching",
+		Short: "Build optimized index from k-mer list",
+		Long:  "Build a fast hybrid index (Bloom filter + hash table + BK-tree) for efficient k-mer matching",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runBuild(kmerFile, output, kmerSize)
 		},
 	}
 	cmd.Flags().StringVarP(&kmerFile, "kmers", "k", "", "Input k-mer file (meryl print output)")
-	cmd.Flags().StringVarP(&output, "output", "o", "bktree.idx", "Output BK-tree index file")
+	cmd.Flags().StringVarP(&output, "output", "o", "kfilt.idx", "Output index file")
 	cmd.Flags().IntVarP(&kmerSize, "kmer-size", "K", 31, "K-mer size")
 	cmd.MarkFlagRequired("kmers")
 	return cmd
 }
 
 func runBuild(kmerFile, output string, kmerSize int) error {
-	log.Printf("Building BK-tree from %s (k=%d)...", kmerFile, kmerSize)
+	log.Printf("Building hybrid index from %s (k=%d)...", kmerFile, kmerSize)
+
 	totalLines, err := countLines(kmerFile)
 	if err != nil {
 		return fmt.Errorf("failed to count k-mers: %v", err)
 	}
+
 	tree := NewBKTree(kmerSize)
+
 	file, err := os.Open(kmerFile)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
+
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+
 	bar := pb.Full.Start64(totalLines)
 	bar.Set(pb.Bytes, false)
 	defer bar.Finish()
+
 	count := int64(0)
 	duplicates := int64(0)
+
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
@@ -330,17 +518,27 @@ func runBuild(kmerFile, output string, kmerSize int) error {
 		}
 		bar.Increment()
 	}
+
 	if err := scanner.Err(); err != nil {
 		return err
 	}
+
 	bar.Finish()
+
 	log.Printf("Processed %d k-mers, %d unique, %d duplicates", count, tree.Count, duplicates)
-	log.Printf("Saving index to %s...", output)
-	if err := tree.Save(output); err != nil {
+
+	log.Printf("Building hybrid index structures...")
+	hybrid := NewHybridIndex(tree)
+	hybrid.BuildFromBKTree()
+
+	log.Printf("Saving complete hybrid index to %s...", output)
+	if err := hybrid.Save(output); err != nil {
 		return fmt.Errorf("failed to save index: %v", err)
 	}
+
 	info, _ := os.Stat(output)
 	log.Printf("Index saved successfully (%.2f MB)", float64(info.Size())/1024/1024)
+
 	return nil
 }
 
@@ -406,15 +604,12 @@ func filterCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "filter",
 		Short: "Filter reads based on k-mer matching",
-		Long: `Filter FASTA/FASTQ reads that contain k-mers matching the BK-tree index.
+		Long: `Filter FASTA/FASTQ reads using hybrid index with Bloom filter quick rejection.
 
 Supports three input modes:
   1. Paired-end (separate files): -1 R1.fq -2 R2.fq
   2. Single-end: -1 reads.fq
   3. Interleaved (mixed paired/single): -I interleaved.fq
-
-The tool automatically detects input format (FASTA or FASTQ).
-Output format can be specified with --output-format (fasta or fastq).
 
 For paired-end reads:
   - By default, keeps pair if combined matches >= threshold
@@ -429,7 +624,7 @@ All formats support gzip compression with the -z flag.`,
 	cmd.Flags().StringVarP(&input1, "input1", "1", "", "Input FASTA/FASTQ R1 or single-end")
 	cmd.Flags().StringVarP(&input2, "input2", "2", "", "Input FASTA/FASTQ R2 for paired-end")
 	cmd.Flags().StringVarP(&interleaved, "interleaved", "I", "", "Interleaved FASTA/FASTQ (mixed paired/single)")
-	cmd.Flags().StringVarP(&index, "index", "i", "bktree.idx", "BK-tree index file")
+	cmd.Flags().StringVarP(&index, "index", "i", "kfilt.idx", "Index file")
 	cmd.Flags().StringVarP(&output, "output", "o", "", "Output file")
 	cmd.Flags().StringVarP(&outputFormat, "output-format", "f", "fastq", "Output format: fasta or fastq")
 	cmd.Flags().StringVarP(&verboseFile, "verbose", "v", "", "Verbose per-read output file (optional)")
@@ -496,12 +691,12 @@ func runFilter(input1, input2, interleaved, index, output, outputFormat, verbose
 
 	runtime.GOMAXPROCS(threads)
 
-	log.Printf("Loading BK-tree from %s...", index)
-	tree, err := LoadBKTree(index)
+	log.Printf("Loading hybrid index from %s...", index)
+	hybrid, err := LoadHybridIndex(index)
 	if err != nil {
 		return fmt.Errorf("failed to load index: %v", err)
 	}
-	log.Printf("Loaded index: k=%d, %d k-mers", tree.K, tree.Count)
+	log.Printf("Hybrid index ready: k=%d, %d k-mers", hybrid.bkTree.K, hybrid.bkTree.Count)
 
 	var outWriter *bufio.Writer
 	outFile, err := os.Create(output)
@@ -548,7 +743,7 @@ func runFilter(input1, input2, interleaved, index, output, outputFormat, verbose
 	} else {
 		log.Printf("Filtering mode: Combined matches for pairs")
 	}
-	log.Printf("Filtering reads (min_matches=%d, hamming_dist=%d, threads=%d)...", 
+	log.Printf("Filtering reads (min_matches=%d, hamming_dist=%d, threads=%d)",
 		minMatches, hammingDist, threads)
 
 	var stats *FilterStats
@@ -558,17 +753,17 @@ func runFilter(input1, input2, interleaved, index, output, outputFormat, verbose
 		defer r1Reader.Close()
 		r2Reader := openFile(inputFile2)
 		defer r2Reader.Close()
-		stats = processReadsPaired(r1Reader, r2Reader, outWriter, verboseWriter, tree, 
+		stats = processReadsPaired(r1Reader, r2Reader, outWriter, verboseWriter, hybrid,
 			minMatches, hammingDist, threads, totalReads, bothMatch, format1, outputFormat)
 	case ModeSingleEnd:
 		reader := openFile(inputFile1)
 		defer reader.Close()
-		stats = processReadsSingle(reader, outWriter, verboseWriter, tree, 
+		stats = processReadsSingle(reader, outWriter, verboseWriter, hybrid,
 			minMatches, hammingDist, threads, totalReads, format1, outputFormat)
 	case ModeInterleaved:
 		reader := openFile(inputFile1)
 		defer reader.Close()
-		stats = processReadsInterleavedMixed(reader, outWriter, verboseWriter, tree, 
+		stats = processReadsInterleavedMixed(reader, outWriter, verboseWriter, hybrid,
 			minMatches, hammingDist, threads, totalReads, bothMatch, format1, outputFormat)
 	}
 
@@ -578,12 +773,12 @@ func runFilter(input1, input2, interleaved, index, output, outputFormat, verbose
 		log.Printf("  Paired reads: %d", stats.PairedReads)
 		log.Printf("  Single reads: %d", stats.SingleReads)
 	}
-	log.Printf("Kept reads: %d (%.2f%%)", stats.KeptReads, 
+	log.Printf("Kept reads: %d (%.2f%%)", stats.KeptReads,
 		float64(stats.KeptReads)*100.0/float64(stats.TotalReads))
 	log.Printf("Filtered reads: %d (%.2f%%)", stats.TotalReads-stats.KeptReads,
 		float64(stats.TotalReads-stats.KeptReads)*100.0/float64(stats.TotalReads))
 	log.Printf("Elapsed time: %.2fs", stats.EndTime.Sub(stats.StartTime).Seconds())
-	log.Printf("Throughput: %.2f reads/sec", 
+	log.Printf("Throughput: %.2f reads/sec",
 		float64(stats.TotalReads)/stats.EndTime.Sub(stats.StartTime).Seconds())
 
 	return nil
@@ -716,48 +911,67 @@ func writeRead(w *bufio.Writer, read Read, format string) {
 	}
 }
 
-func countMatchingKmersDetailed(seq string, tree *BKTree, maxHamming int) (int, int, int) {
-	k := tree.K
-	if len(seq) < k {
+func countMatchingKmersOptimized(seq string, idx *HybridIndex, maxHamming int, minMatches int, kmerSize int) (int, int, int) {
+	if len(seq) < kmerSize {
 		return 0, 0, 999
 	}
+
 	matches := 0
-	totalKmers := 0
 	bestDist := 999
 	seqUpper := strings.ToUpper(seq)
+
+	maxForward := len(seqUpper) - kmerSize + 1
+
+	for i := 0; i < maxForward; i++ {
+		kmer := seqUpper[i : i+kmerSize]
+		found, dist := idx.Search(kmer, maxHamming)
+
+		if found {
+			matches++
+			if dist >= 0 && dist < bestDist {
+				bestDist = dist
+			}
+			if matches >= minMatches {
+				totalKmers := maxForward * 2
+				if bestDist == 999 {
+					bestDist = -1
+				}
+				return totalKmers, matches, bestDist
+			}
+		}
+	}
+
 	rcSeq := reverseComplement(seqUpper)
-	for i := 0; i <= len(seqUpper)-k; i++ {
-		kmer := seqUpper[i : i+k]
+	totalKmers := maxForward
+	for i := 0; i <= len(rcSeq)-kmerSize; i++ {
+		kmer := rcSeq[i : i+kmerSize]
 		totalKmers++
-		found, _, dist := tree.SearchDetailed(kmer, maxHamming)
+
+		found, dist := idx.Search(kmer, maxHamming)
+
 		if found {
 			matches++
-			if dist < bestDist {
+			if dist >= 0 && dist < bestDist {
 				bestDist = dist
+			}
+			if matches >= minMatches {
+				break
 			}
 		}
 	}
-	for i := 0; i <= len(rcSeq)-k; i++ {
-		kmer := rcSeq[i : i+k]
-		totalKmers++
-		found, _, dist := tree.SearchDetailed(kmer, maxHamming)
-		if found {
-			matches++
-			if dist < bestDist {
-				bestDist = dist
-			}
-		}
-	}
+
 	if bestDist == 999 {
 		bestDist = -1
 	}
+
 	return totalKmers, matches, bestDist
 }
 
 func processReadsPaired(r1Reader, r2Reader io.ReadCloser, outWriter, verboseWriter *bufio.Writer,
-	tree *BKTree, minMatches, maxHamming int, threads int, totalReads int64, bothMatch bool, 
+	idx *HybridIndex, minMatches, maxHamming int, threads int, totalReads int64, bothMatch bool,
 	inputFormat, outputFormat string) *FilterStats {
 
+	kmerSize := idx.bkTree.K
 	stats := &FilterStats{StartTime: time.Now()}
 	readChan := make(chan ReadPair, threads*4)
 	resultChan := make(chan ReadPair, threads*4)
@@ -779,12 +993,12 @@ func processReadsPaired(r1Reader, r2Reader io.ReadCloser, outWriter, verboseWrit
 
 			if verboseWriter != nil {
 				totalKmers1 := 0
-				if len(pair.R1.Sequence) >= tree.K {
-					totalKmers1 = (len(pair.R1.Sequence) - tree.K + 1) * 2
+				if len(pair.R1.Sequence) >= kmerSize {
+					totalKmers1 = (len(pair.R1.Sequence) - kmerSize + 1) * 2
 				}
 				totalKmers2 := 0
-				if len(pair.R2.Sequence) >= tree.K {
-					totalKmers2 = (len(pair.R2.Sequence) - tree.K + 1) * 2
+				if len(pair.R2.Sequence) >= kmerSize {
+					totalKmers2 = (len(pair.R2.Sequence) - kmerSize + 1) * 2
 				}
 				writeVerbose(verboseWriter, ReadMatchInfo{
 					ReadName:        pair.R1.Name,
@@ -821,8 +1035,8 @@ func processReadsPaired(r1Reader, r2Reader io.ReadCloser, outWriter, verboseWrit
 		go func() {
 			defer workerWg.Done()
 			for pair := range readChan {
-				_, r1Matches, r1BestDist := countMatchingKmersDetailed(pair.R1.Sequence, tree, maxHamming)
-				_, r2Matches, r2BestDist := countMatchingKmersDetailed(pair.R2.Sequence, tree, maxHamming)
+				_, r1Matches, r1BestDist := countMatchingKmersOptimized(pair.R1.Sequence, idx, maxHamming, minMatches, kmerSize)
+				_, r2Matches, r2BestDist := countMatchingKmersOptimized(pair.R2.Sequence, idx, maxHamming, minMatches, kmerSize)
 
 				pair.R1Matches = r1Matches
 				pair.R2Matches = r2Matches
@@ -870,9 +1084,10 @@ func processReadsPaired(r1Reader, r2Reader io.ReadCloser, outWriter, verboseWrit
 }
 
 func processReadsSingle(reader io.ReadCloser, outWriter, verboseWriter *bufio.Writer,
-	tree *BKTree, minMatches, maxHamming int, threads int, totalReads int64, 
+	idx *HybridIndex, minMatches, maxHamming int, threads int, totalReads int64,
 	inputFormat, outputFormat string) *FilterStats {
 
+	kmerSize := idx.bkTree.K
 	stats := &FilterStats{StartTime: time.Now()}
 	readChan := make(chan ReadPair, threads*4)
 	resultChan := make(chan ReadPair, threads*4)
@@ -894,8 +1109,8 @@ func processReadsSingle(reader io.ReadCloser, outWriter, verboseWriter *bufio.Wr
 
 			if verboseWriter != nil {
 				totalKmers := 0
-				if len(pair.R1.Sequence) >= tree.K {
-					totalKmers = (len(pair.R1.Sequence) - tree.K + 1) * 2
+				if len(pair.R1.Sequence) >= kmerSize {
+					totalKmers = (len(pair.R1.Sequence) - kmerSize + 1) * 2
 				}
 				writeVerbose(verboseWriter, ReadMatchInfo{
 					ReadName:        pair.R1.Name,
@@ -923,7 +1138,7 @@ func processReadsSingle(reader io.ReadCloser, outWriter, verboseWriter *bufio.Wr
 		go func() {
 			defer workerWg.Done()
 			for pair := range readChan {
-				_, matches, bestDist := countMatchingKmersDetailed(pair.R1.Sequence, tree, maxHamming)
+				_, matches, bestDist := countMatchingKmersOptimized(pair.R1.Sequence, idx, maxHamming, minMatches, kmerSize)
 				pair.R1Matches = matches
 				pair.R1BestDist = bestDist
 				pair.Matches = matches >= minMatches
@@ -956,9 +1171,10 @@ func processReadsSingle(reader io.ReadCloser, outWriter, verboseWriter *bufio.Wr
 }
 
 func processReadsInterleavedMixed(reader io.ReadCloser, outWriter, verboseWriter *bufio.Writer,
-	tree *BKTree, minMatches, maxHamming int, threads int, totalReads int64, bothMatch bool, 
+	idx *HybridIndex, minMatches, maxHamming int, threads int, totalReads int64, bothMatch bool,
 	inputFormat, outputFormat string) *FilterStats {
 
+	kmerSize := idx.bkTree.K
 	stats := &FilterStats{StartTime: time.Now()}
 	readChan := make(chan ReadPair, threads*4)
 	resultChan := make(chan ReadPair, threads*4)
@@ -984,8 +1200,8 @@ func processReadsInterleavedMixed(reader io.ReadCloser, outWriter, verboseWriter
 
 			if verboseWriter != nil {
 				totalKmers1 := 0
-				if len(pair.R1.Sequence) >= tree.K {
-					totalKmers1 = (len(pair.R1.Sequence) - tree.K + 1) * 2
+				if len(pair.R1.Sequence) >= kmerSize {
+					totalKmers1 = (len(pair.R1.Sequence) - kmerSize + 1) * 2
 				}
 				writeVerbose(verboseWriter, ReadMatchInfo{
 					ReadName:        pair.R1.Name,
@@ -998,8 +1214,8 @@ func processReadsInterleavedMixed(reader io.ReadCloser, outWriter, verboseWriter
 
 				if pair.IsPair {
 					totalKmers2 := 0
-					if len(pair.R2.Sequence) >= tree.K {
-						totalKmers2 = (len(pair.R2.Sequence) - tree.K + 1) * 2
+					if len(pair.R2.Sequence) >= kmerSize {
+						totalKmers2 = (len(pair.R2.Sequence) - kmerSize + 1) * 2
 					}
 					writeVerbose(verboseWriter, ReadMatchInfo{
 						ReadName:        pair.R2.Name,
@@ -1031,12 +1247,12 @@ func processReadsInterleavedMixed(reader io.ReadCloser, outWriter, verboseWriter
 		go func() {
 			defer workerWg.Done()
 			for pair := range readChan {
-				_, r1Matches, r1BestDist := countMatchingKmersDetailed(pair.R1.Sequence, tree, maxHamming)
+				_, r1Matches, r1BestDist := countMatchingKmersOptimized(pair.R1.Sequence, idx, maxHamming, minMatches, kmerSize)
 				pair.R1Matches = r1Matches
 				pair.R1BestDist = r1BestDist
 
 				if pair.IsPair {
-					_, r2Matches, r2BestDist := countMatchingKmersDetailed(pair.R2.Sequence, tree, maxHamming)
+					_, r2Matches, r2BestDist := countMatchingKmersOptimized(pair.R2.Sequence, idx, maxHamming, minMatches, kmerSize)
 					pair.R2Matches = r2Matches
 					pair.R2BestDist = r2BestDist
 
@@ -1095,7 +1311,7 @@ func versionCommand() *cobra.Command {
 		Use:   "version",
 		Short: "Print version information",
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Printf("kfilt version %s\n", version)
+			fmt.Printf("kfilt version %s (hybrid+bloom persistent)\n", version)
 			fmt.Printf("Go version: %s\n", runtime.Version())
 			fmt.Printf("OS/Arch: %s/%s\n", runtime.GOOS, runtime.GOARCH)
 		},
@@ -1105,19 +1321,13 @@ func versionCommand() *cobra.Command {
 func main() {
 	rootCmd := &cobra.Command{
 		Use:   "kfilt",
-		Short: "Efficient k-mer based read filtering using BK-trees",
-		Long: `kfilt: Fast and efficient k-mer based read filtering
+		Short: "k-mer filtering with persistent hybrid index",
+		Long: `kfilt v1.1: k-mer based read filtering
 
-This tool filters FASTA/FASTQ reads based on k-mer matching with support for
-Hamming distance and reverse complement checking. It uses BK-trees for
-efficient approximate k-mer matching.
-
-Workflow:
-  1. Build an index from k-mer list (e.g., from meryl difference)
-  2. Filter multiple FASTA/FASTQ samples using the same index
-
-The BK-tree index allows for efficient reuse across many samples without
-rebuilding, making it ideal for processing large cohorts.`,
+This tool uses a persistent hybrid index combining:
+  - Bloom filter for quick rejection (O(1))
+  - Hash table for exact and 1-mismatch k-mers (O(1))
+  - BK-tree for distance 2+ (logarithmic)`,
 	}
 	rootCmd.CompletionOptions.DisableDefaultCmd = true
 	rootCmd.AddCommand(buildCommand())
